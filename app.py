@@ -633,7 +633,7 @@ elif st.session_state.role == "production":
     folder_path = DEFAULT_FOLDER_PATH
     tci_path_input = DEFAULT_TCI_PATH
     AMP_FILE_PATH = DEFAULT_AMP_PATH
-    st.sidebar.info("📌 **Production Mode**\nYou have read and download permissions for saved reports.")
+    st.sidebar.info("📌 **Production Mode**\nOpen the **Production Workspace** tab to view and work on reports sent to you by the Planning team.")
 
 # 4. UNASSIGNED / VIEWER ROLE CONFIGURATION
 else:
@@ -1603,7 +1603,10 @@ def get_saved_reports_list():
                     "is_fully_done": is_fully_done,
                     "last_completed_date": last_completed_date,
                     "last_completed_by": last_completed_by,
-                    "status_label": "✅ COMPLIANT" if is_fully_done else f"⏳ IN PROGRESS ({completed_tasks}/{total_tasks})"
+                    "status_label": "✅ COMPLIANT" if is_fully_done else f"⏳ IN PROGRESS ({completed_tasks}/{total_tasks})",
+                    "published_to_production": meta.get("published_to_production", False),
+                    "published_at": meta.get("published_at", ""),
+                    "published_by": meta.get("published_by", "")
                 })
     except Exception as e:
         logger.error("Error scanning saved reports directory: %s", e)
@@ -1812,7 +1815,10 @@ def save_report(file_bytes, filename, report_type, user_email=None):
             "report_type": report_type,
             "created_by": actual_user,
             "created_at": created_time,
-            "file_path": file_path
+            "file_path": file_path,
+            "published_to_production": False,
+            "published_at": "",
+            "published_by": ""
         }
         write_json_atomic(meta_path, meta_data)
 
@@ -1862,9 +1868,130 @@ def rename_saved_report(old_filename, new_filename):
         return False, f"Failed to rename file: {str(e)}"
 
 # ==========================================
+# REPORT PUBLISH / RECALL HELPERS
+# ==========================================
+def publish_report_to_production(file_path: str, user_email: str):
+    """
+    Marks a saved report as published to Production by setting the
+    `published_to_production` flag in its JSON sidecar to True.
+    Until this is called, the report is invisible to production users.
+    """
+    meta_path = file_path + ".json"
+    meta_data = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as mf:
+                meta_data = json.load(mf)
+        except Exception as e:
+            logger.error("Could not read sidecar %s before publish: %s", meta_path, e)
+    meta_data["published_to_production"] = True
+    meta_data["published_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    meta_data["published_by"] = user_email
+    try:
+        write_json_atomic(meta_path, meta_data)
+        return True, "Report sent to Production successfully!"
+    except Exception as e:
+        logger.error("Failed to publish report %s: %s", file_path, e)
+        return False, f"Failed to send report to Production: {str(e)}"
+
+
+def recall_report_from_production(file_path: str, user_email: str):
+    """
+    Recalls a report from the Production Workspace by setting
+    `published_to_production` back to False. The report returns to draft state
+    and is no longer visible to production users in Tab 2.
+    """
+    meta_path = file_path + ".json"
+    meta_data = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as mf:
+                meta_data = json.load(mf)
+        except Exception as e:
+            logger.error("Could not read sidecar %s before recall: %s", meta_path, e)
+    meta_data["published_to_production"] = False
+    meta_data["published_at"] = ""
+    meta_data["published_by"] = ""
+    try:
+        write_json_atomic(meta_path, meta_data)
+        return True, "Report recalled from Production successfully!"
+    except Exception as e:
+        logger.error("Failed to recall report %s: %s", file_path, e)
+        return False, f"Failed to recall report from Production: {str(e)}"
+
+
+# ==========================================
+# HEADER: CURRENT DATE, JULIAN, AND LIVE TIME
+# ==========================================
+import streamlit.components.v1 as components
+
+now_dt = datetime.now()
+date_str = now_dt.strftime("%d-%b-%Y").upper()
+julian_str = now_dt.strftime("%y%j")
+
+html_code = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{
+            margin: 0; padding: 0; font-family: 'Inter', sans-serif; background-color: transparent; overflow: hidden;
+        }}
+        .banner {{
+            display: flex; justify-content: flex-end; align-items: center; gap: 24px;
+            padding: 10px 18px; margin-bottom: 2px;
+            background: linear-gradient(to right, #ffffff, #f8fafc);
+            border-radius: 8px; border-left: 4px solid #0284c7;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border-top: 1px solid #f1f5f9; border-right: 1px solid #f1f5f9; border-bottom: 1px solid #f1f5f9;
+        }}
+        .item {{ display: flex; align-items: center; gap: 8px; }}
+        .icon {{ font-size: 1.1rem; }}
+        .label {{ font-size: 0.75rem; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .value {{ font-family: monospace; font-size: 1rem; font-weight: 600; color: #0f172a; }}
+        .divider {{ width: 1px; height: 24px; background-color: #cbd5e1; }}
+    </style>
+</head>
+<body>
+    <div class="banner">
+        <div class="item">
+            <span class="icon">📅</span>
+            <span class="label">Date</span>
+            <span class="value">{date_str}</span>
+        </div>
+        <div class="divider"></div>
+        <div class="item">
+            <span class="icon">✈️</span>
+            <span class="label">Julian</span>
+            <span class="value">{julian_str}</span>
+        </div>
+        <div class="divider"></div>
+        <div class="item">
+            <span class="icon">🕒</span>
+            <span class="label">Time</span>
+            <span class="value" id="time-val">--:--:--</span>
+        </div>
+    </div>
+    <script>
+        function updateClock() {{
+            const now = new Date();
+            const hours = String(now.getHours()).padStart(2, '0');
+            const minutes = String(now.getMinutes()).padStart(2, '0');
+            const seconds = String(now.getSeconds()).padStart(2, '0');
+            document.getElementById('time-val').textContent = hours + ':' + minutes + ':' + seconds;
+        }}
+        setInterval(updateClock, 1000);
+        updateClock();
+    </script>
+</body>
+</html>
+"""
+components.html(html_code, height=65)
+
+# ==========================================
 # MAIN CONTENT TABS
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["🛫 Fleet Review", "📁 Saved Reports & Compliance", "🛠️ Admin Tools"])
+tab1, tab2, tab3 = st.tabs(["🛫 Fleet Review", "⚙️ Production Workspace", "🛠️ Admin Tools"])
 
 with tab3:
     if st.session_state.role == "admin":
@@ -2331,6 +2458,166 @@ with tab1:
 
         elif not st.session_state.all_results and run_button:
             st.info("No maintenance checks due within the specified thresholds.")
+
+        # ==========================================
+        # MY SAVED REPORTS — Publish-Gate Panel
+        # Always visible to Admin & Planner in Tab 1
+        # ==========================================
+        st.divider()
+        st.subheader("📂 My Saved Reports")
+        st.caption(
+            "Reports saved here are in **Draft** and invisible to Production until you explicitly "
+            "send them. Click **🚀 Send to Production** to make a report available in the Production Workspace tab."
+        )
+
+        planner_reports_df = get_saved_reports_list()
+        current_user_tab1 = st.session_state.get("user_email", "")
+        is_admin_tab1 = st.session_state.role == "admin"
+
+        # All planners and admins see all reports in this view
+        # No filtering by creator needed.
+
+        if planner_reports_df.empty:
+            st.info("📋 No saved reports yet. Generate and save a report above to get started.")
+        else:
+            for _, rep_row in planner_reports_df.iterrows():
+                rep_name     = rep_row["filename"]
+                rep_path     = rep_row["file_path"]
+                rep_created  = rep_row["created_at"]
+                rep_by       = rep_row["created_by"]
+                rep_tasks    = rep_row.get("total_tasks_display", "—")
+                is_published = bool(rep_row.get("published_to_production", False))
+                pub_at       = rep_row.get("published_at", "")
+                pub_by       = rep_row.get("published_by", "")
+
+                with st.container(border=True):
+                    col_info, col_badge, col_pub, col_dl, col_ren, col_del = st.columns([2.5, 1.5, 1.8, 1.2, 1, 1])
+
+                    with col_info:
+                        st.markdown(f"**📄 {rep_name}**")
+                        st.caption(f"Created by **{rep_by}** on {rep_created} · Tasks: {rep_tasks}")
+                        if is_published and pub_at:
+                            st.caption(f"✅ Sent to Production by **{pub_by}** on {pub_at}")
+
+                    with col_badge:
+                        if is_published:
+                            st.markdown(
+                                "<div style='padding:6px 10px;background:#DCFCE7;border-radius:8px;"
+                                "border:1px solid #86EFAC;text-align:center;'>"
+                                "<span style='color:#166534;font-weight:700;font-size:0.8rem;'>"
+                                "✅ SENT TO PRODUCTION</span></div>",
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.markdown(
+                                "<div style='padding:6px 10px;background:#FEF3C7;border-radius:8px;"
+                                "border:1px solid #FCD34D;text-align:center;'>"
+                                "<span style='color:#92400E;font-weight:700;font-size:0.8rem;'>"
+                                "📝 DRAFT</span></div>",
+                                unsafe_allow_html=True
+                            )
+
+                    is_creator_tab1 = current_user_tab1.lower() == rep_by.lower()
+                    can_manage_pub = is_admin_tab1 or is_creator_tab1
+                    can_edit = is_admin_tab1 or is_creator_tab1
+
+                    with col_pub:
+                        if not is_published:
+                            if can_manage_pub:
+                                if st.button(
+                                    "🚀 Send to Production",
+                                    key=f"publish_{rep_name}",
+                                    type="primary",
+                                    use_container_width=True
+                                ):
+                                    ok, msg = publish_report_to_production(
+                                        rep_path, current_user_tab1
+                                    )
+                                    if ok:
+                                        st.toast(f"✅ {msg}", icon="🚀")
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                            else:
+                                st.button(
+                                    "🚀 Send to Production",
+                                    key=f"publish_{rep_name}",
+                                    disabled=True,
+                                    use_container_width=True
+                                )
+                        else:
+                            if can_manage_pub:
+                                if st.button(
+                                    "↩️ Recall from Production",
+                                    key=f"recall_{rep_name}",
+                                    type="secondary",
+                                    use_container_width=True
+                                ):
+                                    ok, msg = recall_report_from_production(
+                                        rep_path, current_user_tab1
+                                    )
+                                    if ok:
+                                        st.toast(f"↩️ {msg}", icon="↩️")
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                            else:
+                                st.button(
+                                    "↩️ Recall from Production",
+                                    key=f"recall_{rep_name}",
+                                    disabled=True,
+                                    use_container_width=True
+                                )
+
+                    with col_dl:
+                        if os.path.exists(rep_path):
+                            with open(rep_path, "rb") as file_bytes:
+                                dl_clicked = st.download_button(
+                                    label="⬇️ Download",
+                                    data=file_bytes,
+                                    file_name=rep_name,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    use_container_width=True,
+                                    key=f"t1_dl_{rep_name}"
+                                )
+                                if dl_clicked:
+                                    log_download_activity(rep_name, current_user_tab1)
+                                    st.toast(f"📥 Download logged for {rep_name}", icon="ℹ️")
+                        else:
+                            st.button("⬇️ Missing", disabled=True, use_container_width=True, key=f"t1_dl_miss_{rep_name}")
+
+                    with col_ren:
+                        if can_edit:
+                            with st.popover("✏️ Rename", use_container_width=True, key=f"t1_rename_{rep_name}_{st.session_state.popover_key_rename}"):
+                                st.markdown("### Rename Report")
+                                new_name_in = st.text_input("New Name:", value=rep_name, key=f"t1_rename_in_{rep_name}")
+                                if st.button("Confirm Rename", type="primary", use_container_width=True, key=f"t1_btn_ren_{rep_name}"):
+                                    if new_name_in.strip() and new_name_in != rep_name:
+                                        ok, msg = rename_saved_report(rep_name, new_name_in)
+                                        if ok:
+                                            st.session_state.popover_key_rename += 1
+                                            st.toast(f"✅ {msg}", icon="✏️")
+                                            st.rerun()
+                                        else:
+                                            st.error(msg)
+                        else:
+                            st.button("✏️", disabled=True, use_container_width=True, key=f"t1_no_ren_{rep_name}")
+
+                    with col_del:
+                        if can_edit:
+                            with st.popover("🗑️ Delete", use_container_width=True, key=f"t1_del_{rep_name}_{st.session_state.popover_key_delete}"):
+                                st.markdown("⚠️ **Confirm Deletion**")
+                                st.write(f"Are you sure you want to delete `{rep_name}`?")
+                                if st.button("Yes, Delete", type="primary", use_container_width=True, key=f"t1_btn_del_{rep_name}"):
+                                    ok, msg = delete_saved_report(rep_name, rep_path)
+                                    if ok:
+                                        st.session_state.popover_key_delete += 1
+                                        st.toast(f"🗑️ {msg}", icon="🗑️")
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                        else:
+                            st.button("🗑️", disabled=True, use_container_width=True, key=f"t1_no_del_{rep_name}")
     else:
         st.info("🔒 Fleet Review requires Admin or Planner access. Contact an admin to have your role assigned.")
 
@@ -2338,11 +2625,24 @@ with tab2:
     st.divider()
     expander_open = True if st.session_state.role == "production" else False
 
-    with st.expander("📁 **Saved Reports Repository & Compliance History**", expanded=expander_open):
-        saved_df = get_saved_reports_list()
+    with st.expander("⚙️ **Production Workspace — Reports Sent for Execution**", expanded=expander_open):
+        all_saved_df = get_saved_reports_list()
+
+        # Production only sees reports explicitly published by the Planner/Admin.
+        # Admin and Planner retain full visibility of all published reports here too.
+        if not all_saved_df.empty and "published_to_production" in all_saved_df.columns:
+            saved_df = all_saved_df[
+                all_saved_df["published_to_production"] == True
+            ].reset_index(drop=True)
+        else:
+            saved_df = all_saved_df
 
         if saved_df.empty:
-            st.info("No saved reports found yet.")
+            st.info(
+                "⏳ No reports have been sent to Production yet. "
+                "Ask your Planner to open the **Fleet Review** tab and click "
+                "**🚀 Send to Production** on a saved report."
+            )
         else:
             # Display Overview Table of Saved Reports including Total Hours, B1, B2, and Tasks
             st.dataframe(
