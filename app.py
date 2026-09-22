@@ -2460,6 +2460,32 @@ with tab1:
             st.info("No maintenance checks due within the specified thresholds.")
 
         # ==========================================
+        # MANUAL REPORT UPLOAD
+        # ==========================================
+        st.divider()
+        with st.expander("📤 **Upload Manually Edited Report**", expanded=False):
+            st.info("Upload an Excel file that you previously downloaded and modified. This preserves your manually calculated Julian dates and customized task data.")
+            uploaded_file = st.file_uploader("Select Excel File (.xlsx)", type=["xlsx"])
+            if uploaded_file is not None:
+                default_name = uploaded_file.name.replace(".xlsx", "")
+                custom_name = st.text_input("Report Name:", value=default_name)
+                
+                if st.button("💾 Save Uploaded Report", type="primary"):
+                    if not custom_name.strip():
+                        st.error("Please provide a name for the report.")
+                    else:
+                        import io
+                        file_bytes = io.BytesIO(uploaded_file.getvalue())
+                        current_user_email = st.session_state.get("user_email", "System")
+                        # Use 'Manual Upload' as the report type
+                        ok, msg = save_report(file_bytes, custom_name, "Manual Upload", user_email=current_user_email)
+                        if ok:
+                            st.toast("✅ File uploaded and saved to My Saved Reports!", icon="✅")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to upload: {msg}")
+
+        # ==========================================
         # MY SAVED REPORTS — Publish-Gate Panel
         # Always visible to Admin & Planner in Tab 1
         # ==========================================
