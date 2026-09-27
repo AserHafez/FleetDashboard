@@ -403,16 +403,14 @@ if "export_mode" not in st.session_state:
     st.session_state.export_mode = None
 if "select_all_state" not in st.session_state:
     st.session_state.select_all_state = False
-# Maintenance Review Items filter widget state.
-# Use explicit widget keys rather than feeding widget values back through
-# separate session-state variables; this prevents one-keystroke/two-keystroke
-# lag when Streamlit reruns the script after a filter change.
-if "maintenance_search_filter" not in st.session_state:
-    st.session_state.maintenance_search_filter = ""
-if "maintenance_reg_filter" not in st.session_state:
-    st.session_state.maintenance_reg_filter = "ALL"
-if "maintenance_priority_filter" not in st.session_state:
-    st.session_state.maintenance_priority_filter = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+if "search_filter" not in st.session_state:
+    st.session_state.search_filter = ""
+if "priority_filter" not in st.session_state:
+    st.session_state.priority_filter = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+# New Additions - 24 Sep 2026
+if "popover_key_exec" not in st.session_state:    
+    st.session_state.popover_key_exec = 0
 
 # Falls back to the original hardcoded address if not set in secrets, so
 # existing deployments keep working; but new deployments should set this in
@@ -669,12 +667,7 @@ if st.session_state.role in ["admin", "planner"]:
     st.sidebar.subheader("🔍 Search Criteria")
     available_regs = ["ALL"] + scan_available_registrations(folder_path)
 
-    target_reg = st.sidebar.selectbox(
-        "Aircraft Reg (or ALL)",
-        options=available_regs,
-        index=0,
-        help="Filter the fleet review to a specific aircraft registration."
-    )
+    target_reg = st.sidebar.selectbox("Aircraft Reg (or ALL)", options=available_regs, index=0)
     fh_limit = st.sidebar.number_input("FH Limit", value=600, step=50)
     fc_limit = st.sidebar.number_input("FC Limit", value=300, step=50)
     days_limit = st.sidebar.number_input("Days Limit", value=45, step=5)
@@ -829,11 +822,7 @@ def _is_valid_email_list(value: str) -> bool:
     return all(EMAIL_PATTERN.match(p.strip()) for p in parts if p.strip())
 
 
-def send_bow_via_outlook(to_email, cc_email, subject, body_text, extra_attachments=None):
-    """Send the BOW email without attaching the generated BOW workbook.
-
-    Only files explicitly selected in the optional uploader are attached.
-    """
+def send_bow_via_outlook(to_email, cc_email, subject, body_text, excel_bytes, filename, extra_attachments=None):
     if not _is_valid_email_list(to_email):
         return False, "Please enter a valid recipient email address."
     if cc_email and cc_email.strip() and not _is_valid_email_list(cc_email):
@@ -841,7 +830,12 @@ def send_bow_via_outlook(to_email, cc_email, subject, body_text, extra_attachmen
 
     pythoncom.CoInitialize()
     temp_dir = tempfile.mkdtemp()
-    temp_files_to_clean = []
+    temp_file_path = os.path.join(temp_dir, filename)
+    temp_files_to_clean = [temp_file_path]
+
+    with open(temp_file_path, "wb") as f:
+        f.write(excel_bytes.getvalue())
+
     additional_file_paths = []
     if extra_attachments:
         for uploaded_file in extra_attachments:
@@ -862,8 +856,8 @@ def send_bow_via_outlook(to_email, cc_email, subject, body_text, extra_attachmen
         mail.Subject = subject
         html_body_text = body_text.replace("\n", "<br>")
         mail.HTMLBody = f"<div>{html_body_text}</div><br><br>" + mail.HTMLBody
-
-        # Intentionally do NOT attach the generated BOW workbook.
+        mail.Attachments.Add(temp_file_path)
+        
         for extra_path in additional_file_paths:
             mail.Attachments.Add(extra_path)
         
@@ -1616,9 +1610,7 @@ def get_saved_reports_list():
                     "status_label": "✅ COMPLIANT" if is_fully_done else f"⏳ IN PROGRESS ({completed_tasks}/{total_tasks})",
                     "published_to_production": meta.get("published_to_production", False),
                     "published_at": meta.get("published_at", ""),
-                    "published_by": meta.get("published_by", ""),
-                    "production_first_compliance_at": meta.get("production_first_compliance_at", ""),
-                    "production_first_compliance_by": meta.get("production_first_compliance_by", "")
+                    "published_by": meta.get("published_by", "")
                 })
     except Exception as e:
         logger.error("Error scanning saved reports directory: %s", e)
@@ -1738,15 +1730,6 @@ def save_task_compliance(file_path, edited_df, current_user_email):
     meta_data["is_fully_compliant"] = is_all_done
     meta_data["final_completion_date"] = last_date if is_all_done else ""
     meta_data["final_completed_by"] = last_user if is_all_done else ""
-
-    # Immutable milestone: once Production completes the whole package for the
-    # first time, recall becomes Admin-only. Do not clear this flag if an Admin
-    # later reopens/reviews the compliance data.
-    current_role = str(st.session_state.get("role", "viewer")).lower()
-    if is_all_done and current_role == "production" and not meta_data.get("production_first_compliance_at"):
-        meta_data["production_first_compliance_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        meta_data["production_first_compliance_by"] = current_user_email
-
     meta_data["last_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
@@ -1916,12 +1899,11 @@ def publish_report_to_production(file_path: str, user_email: str):
         return False, f"Failed to send report to Production: {str(e)}"
 
 
-def recall_report_from_production(file_path: str, user_email: str, user_role: str):
-    """Recall a report, unless production has already completed it once.
-
-    After the first full compliance recorded by a Production user, only Admin
-    is allowed to recall the report. The rule is checked here as well as in the
-    UI so it cannot be bypassed by calling the helper from another code path.
+def recall_report_from_production(file_path: str, user_email: str):
+    """
+    Recalls a report from the Production Workspace by setting
+    `published_to_production` back to False. The report returns to draft state
+    and is no longer visible to production users in Tab 2.
     """
     meta_path = file_path + ".json"
     meta_data = {}
@@ -1931,14 +1913,6 @@ def recall_report_from_production(file_path: str, user_email: str, user_role: st
                 meta_data = json.load(mf)
         except Exception as e:
             logger.error("Could not read sidecar %s before recall: %s", meta_path, e)
-
-    first_compliance_at = meta_data.get("production_first_compliance_at", "")
-    if first_compliance_at and str(user_role).lower() != "admin":
-        return False, "Recall is disabled after the first Production compliance. Only Admin can recall this report."
-
-    if str(user_role).lower() not in {"admin", "planner"}:
-        return False, "You are not authorized to recall this report."
-
     meta_data["published_to_production"] = False
     meta_data["published_at"] = ""
     meta_data["published_by"] = ""
@@ -2190,62 +2164,29 @@ with tab1:
             if selected_sections and "ALL" not in selected_sections:
                 final_df = final_df[final_df["Section"].isin(selected_sections)].reset_index(drop=True)
 
-            # Search, Aircraft Registration & Priority filters
-            # IMPORTANT: these widgets operate on the complete generated
-            # Maintenance Review Items dataframe before any filter is applied.
+            # Search & Priority Filter Controls
             st.markdown("### 🔍 Maintenance Review Items")
-
-            available_review_regs = sorted({
-                str(r).strip()
-                for r in final_df.get("Reg", pd.Series(dtype=str)).dropna().tolist()
-                if str(r).strip() and str(r).strip().lower() not in {"nan", "none"}
-            })
-            reg_options = ["ALL"] + available_review_regs
-
-            # If the current registration no longer exists in the newly
-            # generated report, safely return the widget to ALL.
-            if st.session_state.maintenance_reg_filter not in reg_options:
-                st.session_state.maintenance_reg_filter = "ALL"
-
-            c_f1, c_f2, c_f3 = st.columns([2, 1.5, 1.5])
-
+            c_f1, c_f2 = st.columns([2, 2])
             with c_f1:
                 search_q = st.text_input(
                     "Filter by Task Number or Description:",
-                    placeholder="e.g. NDT-42 or 'landing gear'",
-                    key="maintenance_search_filter"
-                ).strip()
-
-            with c_f2:
-                reg_q = st.selectbox(
-                    "Aircraft Reg Filter:",
-                    options=reg_options,
-                    key="maintenance_reg_filter",
-                    help="Filter Maintenance Review Items by aircraft registration."
+                    value=st.session_state.search_filter,
+                    placeholder="e.g. NDT-42 or 'landing gear'"
                 )
-
-            with c_f3:
+                st.session_state.search_filter = search_q
+            with c_f2:
                 prio_q = st.multiselect(
                     "Priority Filter:",
                     ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-                    key="maintenance_priority_filter"
+                    default=st.session_state.priority_filter
                 )
+                st.session_state.priority_filter = prio_q
 
-            # Apply all filters to the same unfiltered generated dataframe.
             if search_q:
-                task_match = final_df["Task"].astype(str).str.contains(
-                    search_q, case=False, na=False, regex=False
-                )
-                desc_match = final_df["Description"].astype(str).str.contains(
-                    search_q, case=False, na=False, regex=False
-                )
-                final_df = final_df[task_match | desc_match]
-
-            if reg_q != "ALL" and "Reg" in final_df.columns:
                 final_df = final_df[
-                    final_df["Reg"].astype(str).str.strip().eq(str(reg_q).strip())
+                    final_df["Task"].astype(str).str.contains(search_q, case=False, na=False) |
+                    final_df["Description"].astype(str).str.contains(search_q, case=False, na=False)
                 ]
-
             if prio_q and "Priority" in final_df.columns:
                 final_df = final_df[final_df["Priority"].isin(prio_q)]
 
@@ -2308,20 +2249,29 @@ with tab1:
 
             selected_rows = edited_df[edited_df["Select"] == True]
 
+            # New Additions - 24 Sep 2026
             st.divider()
             st.subheader("🛠️ Actions & Reports")
 
-            col_btn1, col_btn2 = st.columns(2)
+            col_btn1, col_btn2, col_btn3 = st.columns(3)
 
             with col_btn1:
                 btn_export_selected = st.button(
-                    "📥 Preview & Export Selected Tasks",
-                    type="primary",
+                    "📥 Preview Selected Tasks",
+                    type="secondary",
                     use_container_width=True,
                     disabled=selected_rows.empty
                 )
 
             with col_btn2:
+                btn_export_exec = st.button(
+                    "📊 Executive Report",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=selected_rows.empty
+                )
+
+            with col_btn3:
                 btn_export_bow = st.button(
                     "📄 Preview & Export BOW",
                     type="secondary",
@@ -2333,6 +2283,18 @@ with tab1:
                 with st.spinner("Opening source file(s) and generating Selected Tasks report..."):
                     st.session_state.preview_df = fetch_ldnd_export_data(selected_rows)
                     st.session_state.export_mode = "SELECTED"
+
+            if btn_export_exec:
+                # Keep tasks as parent data and isolate requested columns
+                exec_cols = [
+                    "Reg", "Task", "Remaining FH", "Remaining Days",
+                    "EST Remaining Days", "EST Due Date", "Trigger"
+                ]
+                available_cols = [c for c in exec_cols if c in selected_rows.columns]
+                exec_df = selected_rows[available_cols].copy()
+
+                st.session_state.preview_df = exec_df
+                st.session_state.export_mode = "EXECUTIVE"
 
             if btn_export_bow:
                 with st.spinner("Opening check sheet(s) and generating expanded BOW report..."):
@@ -2443,6 +2405,52 @@ with tab1:
                         else:
                             st.error(msg)
 
+            # New Additions - 24 Sep 2026
+            # --- EXECUTIVE REPORT SECTION ---
+            elif st.session_state.export_mode == "EXECUTIVE":
+                st.subheader("📊 Executive Report Preview")
+                exec_df = st.session_state.preview_df.copy()
+
+                # Display table preview
+                st.dataframe(
+                    exec_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "EST Due Date": st.column_config.DateColumn("EST Due Date", format="DD-MMM-YY"),
+                        "Remaining FH": st.column_config.NumberColumn("Remaining FH", format="%d"),
+                        "Remaining Days": st.column_config.NumberColumn("Remaining Days", format="%d"),
+                        "EST Remaining Days": st.column_config.NumberColumn("EST Remaining Days", format="%d"),
+                    }
+                )
+
+                # Generate Excel buffer
+                excel_data = generate_single_sheet_excel(exec_df, "Executive Report")
+                exec_filename = f"Executive_Report_{date_str}.xlsx"
+
+                col_dl, col_sv = st.columns(2)
+                with col_dl:
+                    st.download_button(
+                        label=f"⬇️ Download Executive Report ({len(exec_df)} parent items)",
+                        data=excel_data,
+                        file_name=exec_filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True
+                    )
+                with col_sv, st.popover("💾 Save As to Portal History", use_container_width=True, key=f"popover_exec_{st.session_state.popover_key_exec}"):
+                    st.markdown("### Save Executive Report")
+                    custom_name = st.text_input("Saved File Name:", value=exec_filename, key="save_as_exec_name")
+                    if st.button("Confirm Save", type="primary", use_container_width=True, key="btn_confirm_save_exec"):
+                        ok, msg = save_report(excel_data, custom_name, "Executive Report", st.session_state.get("user_email"))
+                        if ok:
+                            st.session_state.popover_key_exec += 1
+                            st.toast(f"✅ {msg}", icon="💾")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            
+            
             # --- BOW SECTION ---
             elif st.session_state.export_mode == "BOW":
                 st.subheader("📄 BOW Sheet Preview")
@@ -2510,6 +2518,8 @@ with tab1:
                             cc_email=email_cc,
                             subject=email_subject,
                             body_text=email_body,
+                            excel_bytes=excel_data,
+                            filename=bow_filename,
                             extra_attachments=extra_files
                         )
                         if success:
@@ -2606,11 +2616,6 @@ with tab1:
 
                     is_creator_tab1 = current_user_tab1.lower() == rep_by.lower()
                     can_manage_pub = is_admin_tab1 or is_creator_tab1
-
-                    # Before first Production compliance, the report owner can
-                    # recall it. After first compliance, recall is Admin-only.
-                    first_compliance_recorded = bool(rep_row.get("production_first_compliance_at", ""))
-                    can_recall = is_admin_tab1 or (is_creator_tab1 and not first_compliance_recorded)
                     can_edit = is_admin_tab1 or is_creator_tab1
 
                     with col_pub:
@@ -2638,7 +2643,7 @@ with tab1:
                                     use_container_width=True
                                 )
                         else:
-                            if can_recall:
+                            if can_manage_pub:
                                 if st.button(
                                     "↩️ Recall from Production",
                                     key=f"recall_{rep_name}",
@@ -2646,7 +2651,7 @@ with tab1:
                                     use_container_width=True
                                 ):
                                     ok, msg = recall_report_from_production(
-                                        rep_path, current_user_tab1, st.session_state.role
+                                        rep_path, current_user_tab1
                                     )
                                     if ok:
                                         st.toast(f"↩️ {msg}", icon="↩️")
@@ -2655,7 +2660,7 @@ with tab1:
                                         st.error(msg)
                             else:
                                 st.button(
-                                    "🔒 Recall Admin-Only After Compliance" if first_compliance_recorded else "↩️ Recall from Production",
+                                    "↩️ Recall from Production",
                                     key=f"recall_{rep_name}",
                                     disabled=True,
                                     use_container_width=True

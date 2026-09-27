@@ -403,16 +403,10 @@ if "export_mode" not in st.session_state:
     st.session_state.export_mode = None
 if "select_all_state" not in st.session_state:
     st.session_state.select_all_state = False
-# Maintenance Review Items filter widget state.
-# Use explicit widget keys rather than feeding widget values back through
-# separate session-state variables; this prevents one-keystroke/two-keystroke
-# lag when Streamlit reruns the script after a filter change.
-if "maintenance_search_filter" not in st.session_state:
-    st.session_state.maintenance_search_filter = ""
-if "maintenance_reg_filter" not in st.session_state:
-    st.session_state.maintenance_reg_filter = "ALL"
-if "maintenance_priority_filter" not in st.session_state:
-    st.session_state.maintenance_priority_filter = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+if "search_filter" not in st.session_state:
+    st.session_state.search_filter = ""
+if "priority_filter" not in st.session_state:
+    st.session_state.priority_filter = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 
 # Falls back to the original hardcoded address if not set in secrets, so
 # existing deployments keep working; but new deployments should set this in
@@ -2190,62 +2184,29 @@ with tab1:
             if selected_sections and "ALL" not in selected_sections:
                 final_df = final_df[final_df["Section"].isin(selected_sections)].reset_index(drop=True)
 
-            # Search, Aircraft Registration & Priority filters
-            # IMPORTANT: these widgets operate on the complete generated
-            # Maintenance Review Items dataframe before any filter is applied.
+            # Search & Priority Filter Controls
             st.markdown("### 🔍 Maintenance Review Items")
-
-            available_review_regs = sorted({
-                str(r).strip()
-                for r in final_df.get("Reg", pd.Series(dtype=str)).dropna().tolist()
-                if str(r).strip() and str(r).strip().lower() not in {"nan", "none"}
-            })
-            reg_options = ["ALL"] + available_review_regs
-
-            # If the current registration no longer exists in the newly
-            # generated report, safely return the widget to ALL.
-            if st.session_state.maintenance_reg_filter not in reg_options:
-                st.session_state.maintenance_reg_filter = "ALL"
-
-            c_f1, c_f2, c_f3 = st.columns([2, 1.5, 1.5])
-
+            c_f1, c_f2 = st.columns([2, 2])
             with c_f1:
                 search_q = st.text_input(
                     "Filter by Task Number or Description:",
-                    placeholder="e.g. NDT-42 or 'landing gear'",
-                    key="maintenance_search_filter"
-                ).strip()
-
-            with c_f2:
-                reg_q = st.selectbox(
-                    "Aircraft Reg Filter:",
-                    options=reg_options,
-                    key="maintenance_reg_filter",
-                    help="Filter Maintenance Review Items by aircraft registration."
+                    value=st.session_state.search_filter,
+                    placeholder="e.g. NDT-42 or 'landing gear'"
                 )
-
-            with c_f3:
+                st.session_state.search_filter = search_q
+            with c_f2:
                 prio_q = st.multiselect(
                     "Priority Filter:",
                     ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-                    key="maintenance_priority_filter"
+                    default=st.session_state.priority_filter
                 )
+                st.session_state.priority_filter = prio_q
 
-            # Apply all filters to the same unfiltered generated dataframe.
             if search_q:
-                task_match = final_df["Task"].astype(str).str.contains(
-                    search_q, case=False, na=False, regex=False
-                )
-                desc_match = final_df["Description"].astype(str).str.contains(
-                    search_q, case=False, na=False, regex=False
-                )
-                final_df = final_df[task_match | desc_match]
-
-            if reg_q != "ALL" and "Reg" in final_df.columns:
                 final_df = final_df[
-                    final_df["Reg"].astype(str).str.strip().eq(str(reg_q).strip())
+                    final_df["Task"].astype(str).str.contains(search_q, case=False, na=False) |
+                    final_df["Description"].astype(str).str.contains(search_q, case=False, na=False)
                 ]
-
             if prio_q and "Priority" in final_df.columns:
                 final_df = final_df[final_df["Priority"].isin(prio_q)]
 
